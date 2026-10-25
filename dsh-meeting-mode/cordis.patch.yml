@@ -1,0 +1,15 @@
+# dsh-meeting-mode bundle patch
+# 行只在这里声明一次；config 里的路径按需修改：
+#   keyFile   —— 百炼 API Key 文件（第一行有效，用于实时转写）；也可直接用 apiKey 字段写 key
+#   llmKeyRef —— 纪要生成用的 LLM Key 凭据引用（默认取凭据库里的 DEEPSEEK_API_KEY）
+#   outputDir —— 会议记录输出目录
+- insert:
+    - id: dsh-meeting-mode
+      name: dsh-meeting-mode
+      config:
+        keyFile: 'D:/DSH/插件/ec-img/key.txt'
+        asrModel: 'qwen-audio-3.1-asr-flash-streaming'
+        llmBaseUrl: 'https://api.deepseek.com'
+        llmModel: 'deepseek-chat'
+        llmKeyRef: 'DEEPSEEK_API_KEY'
+        outputDir: 'D:/DSH/本地会议/meetings'

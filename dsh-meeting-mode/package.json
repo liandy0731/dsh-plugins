@@ -1,0 +1,52 @@
+{
+  "name": "dsh-meeting-mode",
+  "version": "0.1.1",
+  "private": true,
+  "description": "会议模式面板：麦克风实时转写（阿里云百炼 Paraformer，Host 代理），会后一键生成会议纪要（Markdown + Word）与 markmap 交互脑图，文件落盘可下载。",
+  "type": "module",
+  "license": "MIT",
+  "author": "liandy0731",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/liandy0731/dsh-meeting-mode.git"
+  },
+  "homepage": "https://github.com/liandy0731/dsh-meeting-mode#readme",
+  "bugs": {
+    "url": "https://github.com/liandy0731/dsh-meeting-mode/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "meeting",
+    "asr",
+    "dashscope",
+    "web-ui"
+  ],
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  }
+}
