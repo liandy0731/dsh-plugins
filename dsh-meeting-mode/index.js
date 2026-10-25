@@ -1009,6 +1009,9 @@ async function generateMinutes(cfg, apiKey, record) {
     summaryCount: minutes.summary.length,
     todoCount: minutes.todos.length,
     generatedAt: Date.now(),
+    summary: minutes.summary,
+    decisions: minutes.decisions,
+    todos: minutes.todos,
   };
   await fs.writeFile(metaPath, JSON.stringify(metaJson, null, 2), 'utf8');
   return {
@@ -1087,6 +1090,8 @@ async function listMeetings(cfg) {
       audioSeconds: meta?.audioSeconds ?? null,
       sentenceCount: meta?.sentenceCount ?? null,
       files,
+      minutesStatus: meta?.minutes ? 'done' : 'none',
+      minutes: meta?.minutes ?? null,
     });
   }
   rows.sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0));

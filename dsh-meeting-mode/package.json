@@ -1,6 +1,6 @@
 {
   "name": "dsh-meeting-mode",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "会议模式面板：麦克风实时转写（阿里云百炼 Paraformer，Host 代理），会后一键生成会议纪要（Markdown + Word）与 markmap 交互脑图，文件落盘可下载。",
   "type": "module",

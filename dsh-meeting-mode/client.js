@@ -346,7 +346,10 @@ window.__ModuleLoader__.load({
         noticeBox: { background: 'var(--dsw-alias-bg-layer-2)', border: '1px solid var(--dsw-alias-state-warn-primary)', borderRadius: 10, padding: '10px 14px', color: 'var(--dsw-alias-label-primary)', fontSize: 13 },
         fileRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, padding: '8px 10px', borderRadius: 8, background: 'var(--dsw-alias-bg-layer-2)' },
         fileName: { fontSize: 13 },
-        historyRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, padding: '8px 10px', borderRadius: 8, border: '1px solid var(--dsw-alias-border-l1)' },
+        historyRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, padding: '8px 10px', borderRadius: 8, border: '1px solid var(--dsw-alias-border-l1)', cursor: 'pointer' },
+        topBar: { position: 'sticky', top: 0, zIndex: 10, display: 'flex', alignItems: 'center', gap: 12, padding: '10px 0', background: 'var(--dsw-alias-bg-base)', borderBottom: '1px solid var(--dsw-alias-border-l1)', marginBottom: 4 },
+        backBtn: { padding: '6px 14px', borderRadius: 8, border: '1px solid var(--dsw-alias-border-l2)', background: 'var(--dsw-alias-bg-layer-1)', color: 'var(--dsw-alias-label-primary)', fontSize: 13, cursor: 'pointer', whiteSpace: 'nowrap' },
+        crumbTitle: { fontWeight: 600, fontSize: 15, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
         historyTitle: { fontSize: 13, fontWeight: 600 },
         historyMeta: { color: 'var(--dsw-alias-label-secondary)', fontSize: 12 },
         badge: { fontSize: 11, padding: '2px 8px', borderRadius: 999, border: '1px solid var(--dsw-alias-border-l2)', color: 'var(--dsw-alias-label-secondary)' },
@@ -437,8 +440,26 @@ window.__ModuleLoader__.load({
         var sinceRef = useRef(0);
         var meetingRef = useRef(null);
         var listRef = useRef(null);
+        var wrapRef = useRef(null);
 
         meetingRef.current = meeting;
+
+        /* 进入详情/错误页时滚回面板顶部，配合顶部粘性导航条 */
+        useEffect(function () {
+          if ((phase === 'stopped' || phase === 'error') && wrapRef.current !== null) {
+            try { wrapRef.current.scrollIntoView({ block: 'start' }); } catch (ignored) {}
+          }
+        }, [phase]);
+
+        /* 详情/错误页支持 ESC 键返回列表 */
+        useEffect(function () {
+          if (phase !== 'stopped' && phase !== 'error') return undefined;
+          function onKey(event) {
+            if (event.key === 'Escape') backToIdle();
+          }
+          document.addEventListener('keydown', onKey);
+          return function () { document.removeEventListener('keydown', onKey); };
+        }, [phase]);
 
         function applySnapshot(st) {
           if (!st || st.phase === 'idle') return false;
@@ -595,6 +616,7 @@ window.__ModuleLoader__.load({
             setMinutesStatus('done');
             setFiles((data && data.files) || []);
             setMinutes((data && data.minutes) || null);
+            api('/meetings').then(function (list) { setHistory((list && list.meetings) || []); }).catch(function () {});
           }).catch(function (err) {
             setMinutesStatus('error');
             setError(err.message);
@@ -612,7 +634,7 @@ window.__ModuleLoader__.load({
           var hasMinutes = Array.isArray(row.files) && row.files.indexOf('会议纪要.md') !== -1;
           setFiles(Array.isArray(row.files) && row.files.length > 0 ? row.files : null);
           setMinutesStatus(hasMinutes ? 'done' : 'none');
-          setMinutes(null);
+          setMinutes(row.minutes !== null && typeof row.minutes === 'object' && Array.isArray(row.minutes.summary) ? row.minutes : null);
           setPhase('stopped');
           api('/state?id=' + encodeURIComponent(row.id)).then(function (st) {
             if (st && st.phase && st.phase !== 'idle') applySnapshot(st);
@@ -632,10 +654,16 @@ window.__ModuleLoader__.load({
 
         var children = [];
 
-        children.push(h('div', { key: 'header', style: S.header },
-          h(PanelIcon, { key: 'icon' }),
-          h('div', { key: 'title', style: S.title }, t('panelTitle')),
-          h('div', { key: 'hint', style: S.hint }, t('panelHint'))));
+        if (phase === 'stopped' || phase === 'error') {
+          children.push(h('div', { key: 'nav', style: S.topBar },
+            h('button', { key: 'back', style: S.backBtn, onClick: backToIdle }, '← ' + t('backIdle')),
+            h('span', { key: 'crumb', style: S.crumbTitle }, meeting !== null ? meeting.title : '')));
+        } else {
+          children.push(h('div', { key: 'header', style: S.header },
+            h(PanelIcon, { key: 'icon' }),
+            h('div', { key: 'title', style: S.title }, t('panelTitle')),
+            h('div', { key: 'hint', style: S.hint }, t('panelHint'))));
+        }
 
         if (error) {
           children.push(h('div', { key: 'error', style: S.errorBox }, t('errorTitle') + '：' + error));
@@ -660,14 +688,14 @@ window.__ModuleLoader__.load({
             history.length === 0
               ? h('div', { key: 'empty', style: S.empty }, t('historyEmpty'))
               : h('div', { key: 'rows', style: { display: 'flex', flexDirection: 'column', gap: 8 } }, history.map(function (row, index) {
-                return h('div', { key: row.id || index, style: S.historyRow },
+                return h('div', { key: row.id || index, style: S.historyRow, onClick: function () { openHistory(row); } },
                   h('div', { key: 'left' },
                     h('div', { style: S.historyTitle }, row.title),
                     h('div', { style: S.historyMeta }, fmtTime(row.startedAt))),
                   h('div', { key: 'right', style: S.row },
                     h('span', { style: Array.isArray(row.files) && row.files.indexOf('会议纪要.md') !== -1 ? S.badgeOk : S.badge },
                       Array.isArray(row.files) && row.files.indexOf('会议纪要.md') !== -1 ? t('historyMinutesReady') : t('historyNoMinutes')),
-                    h('button', { style: S.ghostBtn, onClick: function () { openHistory(row); } }, t('open'))));
+                    h('button', { style: S.ghostBtn, onClick: function (event) { event.stopPropagation(); openHistory(row); } }, t('open'))));
               }))));
         } else if (phase === 'connecting' || phase === 'recording' || phase === 'stopping') {
           var live = phase === 'recording';
@@ -716,7 +744,6 @@ window.__ModuleLoader__.load({
 
           children.push(h('div', { key: 'result', style: S.card },
             h('div', { key: 'row', style: S.row },
-              h('span', { key: 'title', style: { fontWeight: 600, fontSize: 15 } }, meeting !== null ? meeting.title : ''),
               h('span', { key: 'stat', style: S.stat }, t('elapsedLabel') + ' ' + fmtClock(elapsed) + ' · ' + t('audioLabel') + ' ' + fmtClock(audioSeconds) + ' · ' + sentences.length + t('sentenceUnit'))),
             minutesStatus === 'none'
               ? h('div', { key: 'genRow', style: S.row },
@@ -770,17 +797,13 @@ window.__ModuleLoader__.load({
                 showTranscript ? t('hideTranscript') : t('viewTranscript'))),
             showTranscript
               ? h('iframe', { key: 'txt', style: Object.assign({}, S.iframe, { height: 320 }), src: fileUrl(meeting.id, '转写全文.txt'), title: 'transcript' })
-              : null,
-            h('div', { key: 'back', style: S.row },
-              h('button', { style: S.ghostBtn, onClick: backToIdle }, t('backIdle')))));
+              : null));
         } else if (phase === 'error') {
           children.push(h('div', { key: 'errCard', style: S.card },
-            h('div', { style: S.errorBox }, t('errorTitle') + '：' + error),
-            h('div', { style: S.row },
-              h('button', { style: S.ghostBtn, onClick: backToIdle }, t('backIdle')))));
+            h('div', { style: S.errorBox }, t('errorTitle') + '：' + error)));
         }
 
-        return h('div', { style: S.wrap }, children);
+        return h('div', { ref: wrapRef, style: S.wrap }, children);
       }
 
       /* ------------------------------------------------------------ 注册 */
