@@ -1,0 +1,3 @@
+- insert:
+    - id: llm-cost
+      name: dsh-llm-cost

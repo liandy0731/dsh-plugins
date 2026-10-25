@@ -1,0 +1,56 @@
+{
+  "name": "dsh-llm-cost",
+  "version": "0.1.4",
+  "description": "Per-turn and whole-session LLM cost meter for DeepSeek Harness (DeepSeek / GLM official prices, peak and off-peak tariffs, Chinese statutory holidays).",
+  "type": "module",
+  "license": "MIT",
+  "author": "liandy0731",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "llm",
+    "cost",
+    "pricing",
+    "token-usage",
+    "billing"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/liandy0731/dsh-llm-cost.git"
+  },
+  "homepage": "https://github.com/liandy0731/dsh-llm-cost#readme",
+  "bugs": {
+    "url": "https://github.com/liandy0731/dsh-llm-cost/issues"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "README.en.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-chat"
+      ]
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "LLM Cost Meter",
+    "description": "Shows this session's running cost below the composer and each turn's cost in its footer, estimated from token counts and editable unit prices (4 decimals)."
+  }
+}
