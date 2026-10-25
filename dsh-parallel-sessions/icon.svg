@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Session Status">
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#1f6f4a"/>
+  <g fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round">
+    <path d="M16 20h26"/>
+    <path d="M16 32h34"/>
+    <path d="M16 44h20"/>
+  </g>
+  <circle cx="48" cy="20" r="5" fill="#5ce1a0"/>
+  <circle cx="24" cy="44" r="4" fill="#ffffff" opacity="0.55"/>
+</svg>

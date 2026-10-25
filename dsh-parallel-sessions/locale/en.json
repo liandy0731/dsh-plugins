@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session Status",
+    "description": "Every Session's state across all projects: running, done-but-unread, waiting for your approval or answer, and one click back into it."
+  }
+}

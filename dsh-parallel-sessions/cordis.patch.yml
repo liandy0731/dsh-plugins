@@ -1,0 +1,6 @@
+# dsh-parallel-sessions bundle patch —— 当 profile 的 dsh.profile.bundles 列出本包时应用。
+# 行只在这里声明一次；profile 自己的 cordis.patch.yml 不要再重复 insert，
+# 否则同一条目会被挂载两次。
+- insert:
+    - id: dsh-parallel-sessions
+      name: dsh-parallel-sessions

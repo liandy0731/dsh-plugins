@@ -1,0 +1,52 @@
+{
+  "name": "dsh-parallel-sessions",
+  "version": "0.4.0",
+  "private": true,
+  "description": "跨项目「会话状态」面板：按状态上色并标文字（待审批/待回答/计划待审/已完成未看/运行中/空闲），一眼看出该点哪个会话。",
+  "type": "module",
+  "license": "MIT",
+  "author": "liandy0731",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "sessions",
+    "session-status",
+    "web-ui"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/liandy0731/dsh-parallel-sessions.git"
+  },
+  "homepage": "https://github.com/liandy0731/dsh-parallel-sessions#readme",
+  "bugs": {
+    "url": "https://github.com/liandy0731/dsh-parallel-sessions/issues"
+  },
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  }
+}
