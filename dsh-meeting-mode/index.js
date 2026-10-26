@@ -17,6 +17,8 @@
 import crypto from 'node:crypto';
 import https from 'node:https';
 import fs from 'node:fs/promises';
+import { createReadStream, createWriteStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
 import path from 'node:path';
 
 export const name = 'dsh-meeting-mode';
@@ -36,10 +38,20 @@ const DEFAULTS = {
   llmApiKey: '',
   llmKeyRef: 'DEEPSEEK_API_KEY',
   outputDir: 'D:/DSH/本地会议/meetings',
+  /* 会后说话人分离：实时模型都不支持分离，只能把录音用离线模型重跑一遍 */
+  diarizeModel: 'paraformer-v2',
+  diarizeBaseUrl: 'https://dashscope.aliyuncs.com',
+  diarizeSpeakerCount: 0,
+  diarizeTimeoutMinutes: 30,
+  /* 详情页「存入知识库」：直写本地 WeKnora（留空 = 未配置，详情页提示未检测到） */
+  weknoraBaseUrl: '',
+  weknoraApiKey: '',
+  weknoraKnowledgeBaseId: '',
+  weknoraStatus: 'publish',
 };
 
 const PREFIX = '/meeting-mode-api';
-const FILE_NAMES = ['转写全文.txt', '会议纪要.md', '会议纪要.docx', '脑图.html', 'meta.json'];
+const FILE_NAMES = ['转写全文.txt', '会议纪要.md', '会议纪要.docx', '脑图.html', '音频.wav', 'meta.json'];
 
 /* ================================================================ 小工具 */
 
@@ -339,6 +351,7 @@ class AsrSession {
     this.ws = null;
     this.taskId = crypto.randomUUID();
     this.lastAudioAt = 0;
+    this.onAudio = null;
     this.reconnectAttempts = 0;
     this.closedByUs = false;
     this.keepalive = null;
@@ -454,15 +467,9 @@ class AsrSession {
     }
   }
 
-  pushAudio(seq, pcmBase64) {
+  pushAudio(seq, buf) {
     const numeric = Number(seq);
     if (!Number.isInteger(numeric) || numeric < this.expectedSeq) return;
-    let buf;
-    try {
-      buf = Buffer.from(pcmBase64, 'base64');
-    } catch {
-      return;
-    }
     if (buf.length === 0) return;
     this.pending.set(numeric, buf);
     if (this.pending.size > 40) {
@@ -484,6 +491,14 @@ class AsrSession {
         this.ws.sendBinary(buf);
       } catch {
         break;
+      }
+      /* 按 seq 顺序落一份录音：顺序与发给识别服务的一致，会后离线分离要用 */
+      if (this.onAudio) {
+        try {
+          this.onAudio(buf);
+        } catch {
+          /* 录音落盘失败不影响转写 */
+        }
       }
       this.expectedSeq += 1;
     }
@@ -575,6 +590,82 @@ function activeRecord() {
   return null;
 }
 
+/* ================================================================ 录音落盘（会后离线说话人分离用） */
+
+/** 16k / 16bit / 单声道 PCM 的 WAV 头。 */
+function wavHeader(dataBytes, sampleRate) {
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + dataBytes, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * 2, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(dataBytes, 40);
+  return header;
+}
+
+/** 按 seq 顺序把原始 PCM 追加到临时文件（由 AsrSession.drainPending 回调）。 */
+function appendRecordAudio(record, buf) {
+  if (!buf || buf.length === 0) return;
+  try {
+    if (record.pcmStream === null) {
+      record.pcmPath = path.join(record.dir, 'audio.pcm');
+      record.pcmStream = createWriteStream(record.pcmPath);
+      record.pcmStream.on('error', () => {
+        record.pcmStream = null;
+      });
+    }
+    record.pcmBytes += buf.length;
+    record.pcmStream.write(buf);
+  } catch {
+    /* 录音失败不影响实时转写 */
+  }
+}
+
+/** 结束会议时把 PCM 收尾成 音频.wav（离线识别要求容器格式）。 */
+async function finishRecordAudio(record) {
+  const stream = record.pcmStream;
+  record.pcmStream = null;
+  if (stream !== null) {
+    /* 关流可能因为磁盘/权限问题迟迟不回调，最多等 5 秒 */
+    await new Promise((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        resolve();
+      };
+      stream.once('close', finish);
+      stream.once('error', finish);
+      try {
+        stream.end(finish);
+      } catch {
+        finish();
+      }
+      setTimeout(finish, 5000);
+    });
+  }
+  if (!record.pcmBytes || !record.pcmPath) return false;
+  const wavPath = path.join(record.dir, '音频.wav');
+  try {
+    await fs.writeFile(wavPath, wavHeader(record.pcmBytes, Number(record.cfg.sampleRate) || 16000));
+    await pipeline(createReadStream(record.pcmPath), createWriteStream(wavPath, { flags: 'a' }));
+    await fs.unlink(record.pcmPath).catch(() => {});
+    record.wavReady = true;
+    return true;
+  } catch (err) {
+    record.audioError = err instanceof Error ? err.message : String(err);
+    return false;
+  }
+}
+
 function recordSnapshot(record, since) {
   const asr = record.asr;
   const base = Math.max(0, Math.min(Number(since) || 0, asr.sentences.length));
@@ -596,14 +687,43 @@ function recordSnapshot(record, since) {
     minutesStatus: record.minutesStatus ?? 'none',
     minutesError: record.minutesError ?? '',
     files: record.files ?? null,
+    wavReady: record.wavReady === true,
+    diarizeStatus: record.diarizeStatus ?? 'none',
+    diarizeError: record.diarizeError ?? '',
+    speakers: Array.isArray(record.speakers) ? record.speakers : [],
   };
 }
 
+async function mergeMeta(record, patch) {
+  const metaPath = path.join(record.dir, 'meta.json');
+  let meta = {};
+  try {
+    meta = JSON.parse(await fs.readFile(metaPath, 'utf8'));
+  } catch {
+    /* 旧记录可能没有 meta */
+  }
+  Object.assign(meta, patch);
+  await fs.writeFile(metaPath, JSON.stringify(meta, null, 2), 'utf8');
+  return meta;
+}
+
+function transcriptText(record) {
+  const lines = record.asr.sentences.map((sentence) => {
+    const speaker = sentence.speaker ? `${sentence.speaker}：` : '';
+    return `[${fmtClock(sentence.beginTime)}] ${speaker}${sentence.text}`;
+  });
+  return `${record.title}\n${new Date(record.startedAt).toLocaleString('zh-CN')}\n\n${lines.join('\n')}\n`;
+}
+
 async function writeTranscriptFiles(record) {
-  const lines = record.asr.sentences.map((sentence) => `[${fmtClock(sentence.beginTime)}] ${sentence.text}`);
   await fs.mkdir(record.dir, { recursive: true });
-  await fs.writeFile(path.join(record.dir, '转写全文.txt'), `${record.title}\n${new Date(record.startedAt).toLocaleString('zh-CN')}\n\n${lines.join('\n')}\n`, 'utf8');
-  await fs.writeFile(path.join(record.dir, 'meta.json'), JSON.stringify({
+  await fs.writeFile(path.join(record.dir, '转写全文.txt'), transcriptText(record), 'utf8');
+  /* 保留已经生成过的纪要/脑图，避免只重写转写时把文件清单清空 */
+  const files = Array.isArray(record.files) && record.files.length > 0 ? record.files.slice() : [];
+  if (files.indexOf('转写全文.txt') === -1) files.unshift('转写全文.txt');
+  if (record.wavReady && files.indexOf('音频.wav') === -1) files.push('音频.wav');
+  record.files = files;
+  await mergeMeta(record, {
     id: record.id,
     title: record.title,
     startedAt: record.startedAt,
@@ -611,8 +731,15 @@ async function writeTranscriptFiles(record) {
     audioSeconds: Math.round(record.asr.audioSeconds * 10) / 10,
     sentenceCount: record.asr.sentences.length,
     asrModel: record.cfg.asrModel,
-    files: ['转写全文.txt'],
-  }, null, 2), 'utf8');
+    files,
+    speakers: record.speakers ?? [],
+    diarized: record.diarizeStatus === 'done',
+    /* 句子的毫秒区间：宿主重启后还要靠它和离线 speaker 对齐 */
+    sentenceTimes: record.asr.sentences.map((sentence) => [
+      typeof sentence.beginTime === 'number' ? sentence.beginTime : null,
+      typeof sentence.endTime === 'number' ? sentence.endTime : null,
+    ]),
+  });
 }
 
 /** 从落盘的转写全文恢复句子（宿主重启后仍可对历史会议生成纪要）。 */
@@ -628,10 +755,25 @@ async function loadRecordFromDisk(cfg, id) {
       if (match && match[2]) {
         const parts = match[1].split(':').map(Number);
         const ms = parts.length === 3 ? (parts[0] * 3600 + parts[1] * 60 + parts[2]) * 1000 : (parts[0] * 60 + parts[1]) * 1000;
-        sentences.push({ beginTime: ms, endTime: null, text: match[2] });
+        const speakerMatch = /^(说话人\d+)：([\s\S]*)$/.exec(match[2]);
+        sentences.push({
+          beginTime: ms,
+          endTime: null,
+          text: speakerMatch ? speakerMatch[2] : match[2],
+          speaker: speakerMatch ? speakerMatch[1] : null,
+        });
       }
     }
     if (sentences.length === 0) return null;
+    if (Array.isArray(meta.sentenceTimes) && meta.sentenceTimes.length === sentences.length) {
+      sentences.forEach((sentence, index) => {
+        const pair = meta.sentenceTimes[index];
+        if (Array.isArray(pair)) {
+          sentence.beginTime = typeof pair[0] === 'number' ? pair[0] : sentence.beginTime;
+          sentence.endTime = typeof pair[1] === 'number' ? pair[1] : null;
+        }
+      });
+    }
     const record = {
       id,
       title: meta.title || id,
@@ -648,9 +790,16 @@ async function loadRecordFromDisk(cfg, id) {
         expectedSeq: sentences.length,
         stop: async () => {},
       },
-      minutesStatus: 'none',
+      minutesStatus: meta.minutes ? 'done' : 'none',
       minutesError: '',
-      files: null,
+      files: Array.isArray(meta.files) ? meta.files : null,
+      speakers: Array.isArray(meta.speakers) ? meta.speakers : [],
+      diarizeStatus: meta.diarized ? 'done' : 'none',
+      diarizeError: '',
+      wavReady: Array.isArray(meta.files) && meta.files.indexOf('音频.wav') !== -1,
+      pcmStream: null,
+      pcmBytes: 0,
+      pcmPath: '',
     };
     meetings.set(id, record);
     return record;
@@ -799,6 +948,9 @@ ${safe}
 /* ================================================================ 纪要生成 */
 
 function buildMinutesPrompt(meta) {
+  const speakerRule = meta.hasSpeakers
+    ? '本次转写已完成说话人分离，每行开头带「说话人N：」前缀：讨论要点和决议请标注是谁提出或谁负责（直接用说话人标签）；待办的 owner 优先写对应说话人的标签，不要写 未明确。'
+    : '转写没有说话人信息：待办的 owner 从上下文推断，推断不出写 未明确。';
   return [
     '你是资深会议纪要撰写专家。请根据会议转写原文输出一份中文会议纪要，严格只输出一个 JSON 对象，不要输出任何其他文字或代码块标记。',
     'JSON 字段要求：',
@@ -806,10 +958,11 @@ function buildMinutesPrompt(meta) {
     ' "summary": ["摘要要点，3-6 条，每条一句话"],',
     ' "discussion": [{"topic": "议题", "points": ["该议题下的讨论要点，保留关键数字与结论"]}],',
     ' "decisions": ["明确达成的决议，没有则空数组"],',
-    ' "todos": [{"task": "待办事项", "owner": "负责人（从转写推断，推断不出写 未明确）", "due": "截止时间（没有写 未明确）"}],',
+    ' "todos": [{"task": "待办事项", "owner": "负责人（按上方说话人规则填写）", "due": "截止时间（没有写 未明确）"}],',
     ' "risks": ["风险、分歧或待确认事项，没有则空数组"],',
     ' "mindmap": "脑图大纲，markdown 格式：第一行 # 会议主题，二级 ## 议题/结论/待办，三级 - 要点，内容必须来自会议原文"}',
     '要求：只依据转写原文，不要编造；转写可能有语音识别错别字，输出时请按上下文纠正明显错字；语气客观简洁。',
+    speakerRule,
     `会议信息：标题「${meta.title}」，时长约 ${fmtDuration(meta.audioSeconds)}，转写句数 ${meta.sentenceCount}。`,
   ].join('\n');
 }
@@ -980,42 +1133,47 @@ function buildMinutesMarkdown(minutes, meta) {
 async function generateMinutes(cfg, apiKey, record) {
   const sentences = record.asr.sentences;
   if (sentences.length === 0) throw new Error('没有可用的转写内容');
-  const transcriptText = sentences.map((sentence) => `[${fmtClock(sentence.beginTime)}] ${sentence.text}`).join('\n');
+  const transcriptText = sentences.map((sentence) => {
+    const speaker = sentence.speaker ? `${sentence.speaker}：` : '';
+    return `[${fmtClock(sentence.beginTime)}] ${speaker}${sentence.text}`;
+  }).join('\n');
   const meta = {
     title: record.title,
     audioSeconds: record.asr.audioSeconds,
     sentenceCount: sentences.length,
+    hasSpeakers: sentences.some((sentence) => sentence.speaker),
     metaLine: `会议时间：${new Date(record.startedAt).toLocaleString('zh-CN')} · 时长：${fmtDuration(record.stoppedAt ? (record.stoppedAt - record.startedAt) / 1000 : record.asr.audioSeconds)} · 转写：${record.cfg.asrModel} · 纪要：${record.cfg.llmModel}`,
   };
   const raw = await callLlmForMinutes(cfg, apiKey, meta, transcriptText);
   const minutes = normalizeMinutes(raw, meta);
   const markdown = buildMinutesMarkdown(minutes, { ...meta, metaLine: meta.metaLine });
   const docx = buildDocx({ ...minutes, metaLine: meta.metaLine });
-  const html = buildMindmapHtml(minutes.title, minutes.mindmap);
   await fs.mkdir(record.dir, { recursive: true });
   await fs.writeFile(path.join(record.dir, '会议纪要.md'), markdown, 'utf8');
   await fs.writeFile(path.join(record.dir, '会议纪要.docx'), docx);
-  await fs.writeFile(path.join(record.dir, '脑图.html'), html, 'utf8');
-  const metaPath = path.join(record.dir, 'meta.json');
-  let metaJson = {};
-  try {
-    metaJson = JSON.parse(await fs.readFile(metaPath, 'utf8'));
-  } catch {
-    /* 旧记录可能没有 meta */
-  }
-  metaJson.files = ['转写全文.txt', '会议纪要.md', '会议纪要.docx', '脑图.html'];
-  metaJson.minutes = {
-    title: minutes.title,
-    summaryCount: minutes.summary.length,
-    todoCount: minutes.todos.length,
-    generatedAt: Date.now(),
-    summary: minutes.summary,
-    decisions: minutes.decisions,
-    todos: minutes.todos,
-  };
-  await fs.writeFile(metaPath, JSON.stringify(metaJson, null, 2), 'utf8');
+  /* 重新出纪要会让旧脑图过期：删掉 html，状态回到「已总结」，等下一步再出脑图 */
+  await fs.unlink(path.join(record.dir, '脑图.html')).catch(() => {});
+  record.mindmapOutline = minutes.mindmap;
+  const files = ['转写全文.txt'];
+  if (record.wavReady) files.push('音频.wav');
+  files.push('会议纪要.md', '会议纪要.docx');
+  record.files = files;
+  await mergeMeta(record, {
+    files,
+    minutes: {
+      title: minutes.title,
+      summaryCount: minutes.summary.length,
+      todoCount: minutes.todos.length,
+      generatedAt: Date.now(),
+      summary: minutes.summary,
+      decisions: minutes.decisions,
+      todos: minutes.todos,
+      /* 脑图大纲随纪要一起存，下一步只做本地渲染，不再花一次 LLM */
+      mindmap: minutes.mindmap,
+    },
+  });
   return {
-    files: ['转写全文.txt', '会议纪要.md', '会议纪要.docx', '脑图.html'],
+    files,
     minutes: {
       title: minutes.title,
       summary: minutes.summary,
@@ -1023,6 +1181,306 @@ async function generateMinutes(cfg, apiKey, record) {
       todos: minutes.todos,
     },
   };
+}
+
+async function resolveMindmapOutline(record) {
+  if (typeof record.mindmapOutline === 'string' && record.mindmapOutline.trim()) return record.mindmapOutline;
+  try {
+    const meta = JSON.parse(await fs.readFile(path.join(record.dir, 'meta.json'), 'utf8'));
+    if (meta?.minutes?.mindmap) return String(meta.minutes.mindmap);
+    if (meta?.minutes) return buildFallbackMindmap(meta.minutes.title || record.title, meta.minutes);
+  } catch {
+    /* 没有 meta 就走兜底 */
+  }
+  return buildFallbackMindmap(record.title, {});
+}
+
+async function generateMindmap(record) {
+  const outline = await resolveMindmapOutline(record);
+  let title = record.title;
+  try {
+    const meta = JSON.parse(await fs.readFile(path.join(record.dir, 'meta.json'), 'utf8'));
+    if (meta?.minutes?.title) title = String(meta.minutes.title);
+  } catch {
+    /* 用会议标题兜底 */
+  }
+  const html = buildMindmapHtml(title, outline);
+  await fs.mkdir(record.dir, { recursive: true });
+  await fs.writeFile(path.join(record.dir, '脑图.html'), html, 'utf8');
+  const files = Array.isArray(record.files) && record.files.length > 0
+    ? record.files.slice()
+    : ['转写全文.txt', '会议纪要.md', '会议纪要.docx'];
+  if (files.indexOf('脑图.html') === -1) files.push('脑图.html');
+  record.files = files;
+  await mergeMeta(record, { files, mindmapGeneratedAt: Date.now() });
+  return { files };
+}
+
+/* ================================================================ 说话人分离（会后离线重跑） */
+
+/*
+ * 实时流式模型（qwen-audio / paraformer-realtime / fun-asr-realtime）都不返回
+ * speaker，唯一受支持的做法是：会后把录音用离线 paraformer-v2 重跑一遍，
+ * 开启 diarization_enabled，再按毫秒时间戳把 speaker_id 回填到实时句子上。
+ * 录音文件先传到百炼的临时 OSS（48h 有效），任务异步跑，通常几分钟。
+ */
+
+async function dashRequest(cfg, urlPath, options) {
+  const base = String(cfg.diarizeBaseUrl || 'https://dashscope.aliyuncs.com').replace(/\/+$/, '');
+  const res = await fetch(base + urlPath, options);
+  const text = await res.text();
+  let data = null;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = null;
+  }
+  if (!res.ok) {
+    const message = data?.message || data?.code || text.slice(0, 200);
+    throw new Error(`百炼接口 HTTP ${res.status}：${message}`);
+  }
+  if (!data) throw new Error('百炼接口返回了非 JSON 响应');
+  return data;
+}
+
+/** 上传本地录音到百炼临时存储，返回 oss:// 地址。 */
+async function uploadAudioForDiarization(cfg, apiKey, wavPath) {
+  const model = cfg.diarizeModel;
+  const policyData = await dashRequest(cfg, `/api/v1/uploads?action=getPolicy&model=${encodeURIComponent(model)}`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+  const policy = policyData?.data;
+  if (!policy?.upload_host || !policy?.upload_dir) throw new Error('获取文件上传凭证失败');
+  const key = `${policy.upload_dir}/meeting-${Date.now()}.wav`;
+  const form = new FormData();
+  form.append('OSSAccessKeyId', policy.oss_access_key_id);
+  form.append('Signature', policy.signature);
+  form.append('policy', policy.policy);
+  form.append('x-oss-object-acl', policy.x_oss_object_acl);
+  form.append('x-oss-forbid-overwrite', policy.x_oss_forbid_overwrite);
+  form.append('key', key);
+  form.append('success_action_status', '200');
+  let filePart;
+  try {
+    filePart = await fs.openAsBlob(wavPath);
+  } catch {
+    filePart = new Blob([await fs.readFile(wavPath)], { type: 'audio/wav' });
+  }
+  form.append('file', filePart, 'meeting.wav');
+  const res = await fetch(policy.upload_host, { method: 'POST', body: form });
+  if (!res.ok) throw new Error(`上传录音失败：HTTP ${res.status}`);
+  return `oss://${key}`;
+}
+
+async function submitDiarization(cfg, apiKey, ossUrl) {
+  const parameters = { diarization_enabled: true, channel_id: [0] };
+  const hints = String(cfg.languageHints || 'zh,en').split(',').map((item) => item.trim()).filter(Boolean);
+  if (hints.length > 0) parameters.language_hints = hints;
+  const count = Number(cfg.diarizeSpeakerCount) || 0;
+  if (count >= 2) parameters.speaker_count = Math.min(100, Math.floor(count));
+  const data = await dashRequest(cfg, '/api/v1/services/audio/asr/transcription', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'X-DashScope-Async': 'enable',
+      'X-DashScope-OssResourceResolve': 'enable',
+    },
+    body: JSON.stringify({ model: cfg.diarizeModel, input: { file_urls: [ossUrl] }, parameters }),
+  });
+  const taskId = data?.output?.task_id;
+  if (!taskId) throw new Error('提交说话人分离任务失败：没有返回 task_id');
+  return taskId;
+}
+
+async function waitForDiarization(cfg, apiKey, taskId) {
+  const deadline = Date.now() + (Number(cfg.diarizeTimeoutMinutes) || 30) * 60000;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    const data = await dashRequest(cfg, `/api/v1/tasks/${taskId}`, { headers: { Authorization: `Bearer ${apiKey}` } });
+    const output = data?.output ?? {};
+    const status = output.task_status;
+    if (status === 'SUCCEEDED') {
+      const first = Array.isArray(output.results) ? output.results[0] : null;
+      const inner = first && Array.isArray(first.results) ? first.results[0] : null;
+      const url = first?.transcription_url || inner?.transcription_url;
+      if (!url) throw new Error('说话人分离完成但没有返回结果文件地址');
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`下载分离结果失败：HTTP ${res.status}`);
+      return await res.json();
+    }
+    if (status === 'FAILED') {
+      const code = output.code || '';
+      if (code === 'SUCCESS_WITH_NO_VALID_FRAGMENT') throw new Error('没有识别到有效语音，无法区分发言人');
+      throw new Error(`说话人分离失败：${output.message || code || '未知原因'}`);
+    }
+  }
+  throw new Error('说话人分离超时，可稍后重试');
+}
+
+/** 按时间区间重叠把离线 speaker 回填到实时句子（禁止按句子序号对齐）。 */
+function alignSpeakers(record, transcription) {
+  const transcripts = Array.isArray(transcription?.transcripts) ? transcription.transcripts : [];
+  const segments = [];
+  for (const transcript of transcripts) {
+    for (const sentence of Array.isArray(transcript?.sentences) ? transcript.sentences : []) {
+      if (typeof sentence.begin_time === 'number' && typeof sentence.end_time === 'number') segments.push(sentence);
+    }
+  }
+  segments.sort((a, b) => a.begin_time - b.begin_time);
+  if (segments.length === 0) throw new Error('离线识别没有返回句子，无法对齐发言人');
+  const labels = new Map();
+  const labelOf = (speakerId) => {
+    const key = String(speakerId);
+    if (!labels.has(key)) labels.set(key, `说话人${labels.size + 1}`);
+    return labels.get(key);
+  };
+  let matched = 0;
+  const sentences = record.asr.sentences;
+  for (let index = 0; index < sentences.length; index += 1) {
+    const sentence = sentences[index];
+    const begin = sentence.beginTime;
+    if (typeof begin !== 'number') continue;
+    let end = typeof sentence.endTime === 'number' ? sentence.endTime : null;
+    if (end === null || end <= begin) {
+      const next = sentences[index + 1];
+      end = next && typeof next.beginTime === 'number' && next.beginTime > begin ? next.beginTime : begin + 4000;
+    }
+    let best = null;
+    let bestOverlap = 0;
+    for (const segment of segments) {
+      const overlap = Math.min(end, segment.end_time) - Math.max(begin, segment.begin_time);
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap;
+        best = segment;
+      }
+    }
+    if (best !== null && best.speaker_id !== undefined && best.speaker_id !== null) {
+      sentence.speaker = labelOf(best.speaker_id);
+      matched += 1;
+    }
+  }
+  record.speakers = Array.from(labels.values());
+  return matched;
+}
+
+async function runDiarization(record, cfg) {
+  record.diarizeStatus = 'uploading';
+  record.diarizeError = '';
+  try {
+    if (!record.wavReady) {
+      try {
+        await fs.access(path.join(record.dir, '音频.wav'));
+        record.wavReady = true;
+      } catch {
+        throw new Error('这场会议没有保存录音（旧版本录制），无法区分发言人');
+      }
+    }
+    const apiKey = await resolveApiKey(cfg);
+    if (!apiKey) throw new Error('未找到百炼 API Key');
+    const ossUrl = await uploadAudioForDiarization(cfg, apiKey, path.join(record.dir, '音频.wav'));
+    record.diarizeStatus = 'transcribing';
+    const taskId = await submitDiarization(cfg, apiKey, ossUrl);
+    record.diarizeTaskId = taskId;
+    const transcription = await waitForDiarization(cfg, apiKey, taskId);
+    record.diarizeStatus = 'aligning';
+    const matched = alignSpeakers(record, transcription);
+    if (matched === 0) throw new Error('离线识别与实时句子的时间戳对不上，未能标出说话人');
+    record.diarizeStatus = 'done';
+    record.diarizedAt = Date.now();
+    await writeTranscriptFiles(record);
+    await mergeMeta(record, {
+      diarized: true,
+      diarizedAt: record.diarizedAt,
+      speakers: record.speakers,
+      diarizeMatched: matched,
+      diarizeModel: cfg.diarizeModel,
+    });
+  } catch (err) {
+    record.diarizeStatus = 'error';
+    record.diarizeError = err instanceof Error ? err.message : String(err);
+  }
+}
+
+/* ================================================================ 沉淀归档（知识库） */
+
+function normalizeWeknoraBaseUrl(raw) {
+  const value = String(raw || '').trim();
+  if (value === '') return '';
+  const withoutSlash = value.replace(/\/+$/, '');
+  if (/\/api\/v\d+$/.test(withoutSlash)) return withoutSlash;
+  return `${withoutSlash}/api/v1`;
+}
+
+let weknoraProbeCache = { at: 0, result: null };
+
+/** 轻探 WeKnora 是否可用（结果缓存 60s，避免详情页每次挂载都打一发）。 */
+async function probeWeknora(cfg) {
+  const baseUrl = normalizeWeknoraBaseUrl(cfg.weknoraBaseUrl);
+  if (baseUrl === '' || String(cfg.weknoraKnowledgeBaseId || '').trim() === '') {
+    return { configured: false, available: false };
+  }
+  if (Date.now() - weknoraProbeCache.at < 60000 && weknoraProbeCache.result !== null) {
+    return weknoraProbeCache.result;
+  }
+  let result = { configured: true, available: false };
+  try {
+    const headers = {};
+    const apiKey = String(cfg.weknoraApiKey || '').trim();
+    if (apiKey !== '') headers['X-API-Key'] = apiKey;
+    const res = await fetch(`${baseUrl}/knowledge-bases`, { headers, signal: AbortSignal.timeout(3000) });
+    const text = await res.text();
+    let data = null;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = null;
+    }
+    result = { configured: true, available: res.ok && Array.isArray(data?.data) };
+  } catch {
+    result = { configured: true, available: false };
+  }
+  weknoraProbeCache = { at: Date.now(), result };
+  return result;
+}
+
+/** 把会议纪要全文写进 WeKnora「手工知识」，status=publish 才会建索引。 */
+async function saveMeetingToWeknora(cfg, record) {
+  const baseUrl = normalizeWeknoraBaseUrl(cfg.weknoraBaseUrl);
+  const kbId = String(cfg.weknoraKnowledgeBaseId || '').trim();
+  if (baseUrl === '' || kbId === '') throw new Error('未配置知识库：请在插件配置里填写 weknoraBaseUrl / weknoraKnowledgeBaseId');
+  let markdown;
+  try {
+    markdown = await fs.readFile(path.join(record.dir, '会议纪要.md'), 'utf8');
+  } catch {
+    throw new Error('还没有会议纪要，请先点「生成会议纪要」');
+  }
+  const started = new Date(record.startedAt);
+  const stamp = `${started.getFullYear()}-${String(started.getMonth() + 1).padStart(2, '0')}-${String(started.getDate()).padStart(2, '0')}`;
+  const title = `会议纪要：${record.title}（${stamp}）`;
+  const headers = { 'Content-Type': 'application/json' };
+  const apiKey = String(cfg.weknoraApiKey || '').trim();
+  if (apiKey !== '') headers['X-API-Key'] = apiKey;
+  const res = await fetch(`${baseUrl}/knowledge-bases/${encodeURIComponent(kbId)}/knowledge/manual`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ title, content: markdown, status: String(cfg.weknoraStatus || 'publish') }),
+    signal: AbortSignal.timeout(30000),
+  });
+  const text = await res.text();
+  let data = null;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = null;
+  }
+  if (!res.ok || data?.success !== true) {
+    throw new Error(`WeKnora 写入失败（HTTP ${res.status}）：${text.slice(0, 300)}`);
+  }
+  const entry = data.data ?? {};
+  const knowledgeId = String(entry.id ?? '');
+  await mergeMeta(record, { weknoraKnowledgeId: knowledgeId, weknoraSavedAt: Date.now() });
+  return { ok: true, knowledge_id: knowledgeId, parse_status: String(entry.parse_status ?? 'pending'), title };
 }
 
 /* ================================================================ 路由 */
@@ -1065,7 +1523,7 @@ async function resolveLlmKey(ctx, cfg, asrKey) {
   return asrKey;
 }
 
-async function listMeetings(cfg) {
+async function listMeetings(cfg, brief = false) {
   let entries = [];
   try {
     entries = await fs.readdir(cfg.outputDir, { withFileTypes: true });
@@ -1082,7 +1540,7 @@ async function listMeetings(cfg) {
       meta = null;
     }
     const files = Array.isArray(meta?.files) ? meta.files : [];
-    rows.push({
+    const row = {
       id: entry.name,
       title: meta?.title || entry.name.replace(/^[0-9]{8}-[0-9]{4}_/, ''),
       startedAt: meta?.startedAt ?? null,
@@ -1091,8 +1549,12 @@ async function listMeetings(cfg) {
       sentenceCount: meta?.sentenceCount ?? null,
       files,
       minutesStatus: meta?.minutes ? 'done' : 'none',
-      minutes: meta?.minutes ?? null,
-    });
+      diarized: meta?.diarized === true,
+      speakers: Array.isArray(meta?.speakers) ? meta.speakers : [],
+    };
+    /* brief：侧栏状态轮询只关心「有没有出纪要/脑图」，不传整份纪要内容 */
+    if (!brief) row.minutes = meta?.minutes ?? null;
+    rows.push(row);
   }
   rows.sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0));
   return rows.slice(0, 50);
@@ -1104,6 +1566,7 @@ const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   '.json': 'application/json; charset=utf-8',
+  '.wav': 'audio/wav',
 };
 
 async function serveFile(cfg, res, query) {
@@ -1164,7 +1627,16 @@ async function route(req, res, cfg, ctx) {
       minutesStatus: 'none',
       minutesError: '',
       files: null,
+      pcmStream: null,
+      pcmBytes: 0,
+      pcmPath: '',
+      wavReady: false,
+      audioError: '',
+      speakers: [],
+      diarizeStatus: 'none',
+      diarizeError: '',
     };
+    asr.onAudio = (buf) => appendRecordAudio(record, buf);
     meetings.set(record.id, record);
     try {
       await asr.start();
@@ -1201,14 +1673,17 @@ async function route(req, res, cfg, ctx) {
       json(res, 409, { error: record.asr.error });
       return;
     }
-    record.asr.pushAudio(body.seq, String(body.pcm || ''));
+    const pcm = Buffer.from(String(body.pcm || ''), 'base64');
+    record.asr.pushAudio(body.seq, pcm);
     json(res, 200, { ok: true });
     return;
   }
 
   if (req.method === 'GET' && sub === '/state') {
     const id = query.get('id');
-    const record = (id && meetings.get(id)) || activeRecord() || null;
+    let record = (id && meetings.get(id)) || activeRecord() || null;
+    /* 宿主重启后内存里没有历史会议：按 id 从磁盘恢复，才能看到纪要/脑图/说话人状态 */
+    if (record === null && id) record = await loadRecordFromDisk(cfg, id);
     if (!record) {
       json(res, 200, { phase: 'idle' });
       return;
@@ -1226,6 +1701,7 @@ async function route(req, res, cfg, ctx) {
     }
     await record.asr.stop();
     record.stoppedAt = Date.now();
+    await finishRecordAudio(record);
     try {
       await writeTranscriptFiles(record);
     } catch (err) {
@@ -1237,6 +1713,9 @@ async function route(req, res, cfg, ctx) {
       sentenceCount: record.asr.sentences.length,
       audioSeconds: Math.round(record.asr.audioSeconds * 10) / 10,
       dir: record.dir,
+      files: record.files ?? ['转写全文.txt'],
+      wavReady: record.wavReady === true,
+      audioError: record.audioError || '',
     });
     return;
   }
@@ -1275,8 +1754,84 @@ async function route(req, res, cfg, ctx) {
     return;
   }
 
+  if (req.method === 'POST' && sub === '/mindmap') {
+    const body = await readJsonBody(req);
+    const id = String(body.id || '');
+    let record = meetings.get(id) ?? null;
+    if (record === null) record = await loadRecordFromDisk(cfg, id);
+    if (record === null) {
+      json(res, 404, { error: '会议不存在，或转写全文尚未保存' });
+      return;
+    }
+    try {
+      const result = await generateMindmap(record);
+      json(res, 200, result);
+    } catch (err) {
+      json(res, 502, { error: `脑图生成失败：${err instanceof Error ? err.message : String(err)}` });
+    }
+    return;
+  }
+
+  if (req.method === 'POST' && sub === '/diarize') {
+    const body = await readJsonBody(req);
+    const id = String(body.id || '');
+    let record = meetings.get(id) ?? null;
+    if (record === null) record = await loadRecordFromDisk(cfg, id);
+    if (record === null) {
+      json(res, 404, { error: '会议不存在，或转写全文尚未保存' });
+      return;
+    }
+    if (record.diarizeStatus === 'uploading' || record.diarizeStatus === 'transcribing' || record.diarizeStatus === 'aligning') {
+      json(res, 409, { error: '正在区分发言人，请稍候' });
+      return;
+    }
+    if (record.wavReady !== true) {
+      try {
+        await fs.access(path.join(record.dir, '音频.wav'));
+        record.wavReady = true;
+      } catch {
+        json(res, 400, { error: '这场会议没有保存录音（旧版本录制），无法区分发言人' });
+        return;
+      }
+    }
+    record.diarizeStatus = 'uploading';
+    record.diarizeError = '';
+    /* 后台跑：上传 → 离线识别排队 → 对齐，通常要几分钟，不能让 HTTP 请求一直挂着 */
+    runDiarization(record, cfg).catch(() => {});
+    json(res, 202, { id: record.id, status: record.diarizeStatus });
+    return;
+  }
+
+  if (req.method === 'GET' && sub === '/integrations') {
+    const weknora = await probeWeknora(cfg);
+    json(res, 200, { weknora, outputDir: cfg.outputDir });
+    return;
+  }
+
+  if (req.method === 'POST' && sub === '/save') {
+    const body = await readJsonBody(req);
+    const id = String(body.id || '');
+    const target = String(body.target || '');
+    let record = meetings.get(id) ?? null;
+    if (record === null) record = await loadRecordFromDisk(cfg, id);
+    if (record === null) {
+      json(res, 404, { error: '会议不存在，或转写全文尚未保存' });
+      return;
+    }
+    if (target === 'weknora') {
+      try {
+        json(res, 200, await saveMeetingToWeknora(cfg, record));
+      } catch (err) {
+        json(res, 502, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+    json(res, 400, { error: `未知的沉淀目标：${target}` });
+    return;
+  }
+
   if (req.method === 'GET' && sub === '/meetings') {
-    json(res, 200, { meetings: await listMeetings(cfg) });
+    json(res, 200, { meetings: await listMeetings(cfg, query.get('brief') === '1') });
     return;
   }
 

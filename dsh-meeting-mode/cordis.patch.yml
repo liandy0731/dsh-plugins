@@ -3,6 +3,10 @@
 #   keyFile   —— 百炼 API Key 文件（第一行有效，用于实时转写）；也可直接用 apiKey 字段写 key
 #   llmKeyRef —— 纪要生成用的 LLM Key 凭据引用（默认取凭据库里的 DEEPSEEK_API_KEY）
 #   outputDir —— 会议记录输出目录
+# 可选：详情页「存入知识库」需要 WeKnora 连接信息（weknoraBaseUrl / weknoraApiKey /
+#   weknoraKnowledgeBaseId）。默认留空 → 详情页显示「未检测到知识库」。
+#   密钥不要写进本文件（本包会发布到公开仓库），请在本机 profile 的 cordis.patch.yml
+#   里用 `- id: dsh-meeting-mode` 覆盖（注意 patch 按 id 整块替换 config，需重复全部字段）。
 - insert:
     - id: dsh-meeting-mode
       name: dsh-meeting-mode
